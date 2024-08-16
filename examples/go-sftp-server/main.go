@@ -121,8 +121,6 @@ func main() {
 
 			serverOptions := []sftp.ServerOption{
 				sftp.WithDebug(debugStream),
-				sftp.WithMaxTxPacket(32768 * 1024),
-				sftp.WithAllocator(),
 			}
 
 			if readOnly {

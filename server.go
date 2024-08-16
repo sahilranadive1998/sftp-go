@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/rdleal/intervalst/interval"
 	"github.com/vmware/go-nfs-client/nfs"
 	"github.com/vmware/go-nfs-client/nfs/rpc"
 )
@@ -28,6 +29,13 @@ const (
 // This is intended to provide the sftp subsystem to an ssh server daemon.
 // This implementation currently supports most of sftp server protocol version 3,
 // as specified at https://filezilla-project.org/specs/draft-ietf-secsh-filexfer-02.txt
+
+type treeEntry struct {
+	startOffset int64
+	endOffset   int64
+	data        []byte
+}
+
 type Server struct {
 	*serverConn
 	debugStream   io.Writer
@@ -40,6 +48,8 @@ type Server struct {
 	handleCount   int
 	workDir       string
 	maxTxPacket   uint32
+	cache         *interval.SearchTree[treeEntry, int64]
+	count         int
 }
 
 func (svr *Server) nextHandle(f *os.File) string {
@@ -102,6 +112,7 @@ func NewServer(rwc io.ReadWriteCloser, options ...ServerOption) (*Server, error)
 		pktMgr:      newPktMgr(svrConn),
 		openFiles:   make(map[string]*os.File),
 		maxTxPacket: defaultMaxTxPacket,
+		count:       1,
 	}
 
 	for _, o := range options {
@@ -236,6 +247,15 @@ func handlePacket(s *Server, p orderedRequest) error {
 		// defer v.Close()
 
 		s.nfsTarget = v
+		cmpFn := func(x, y int64) int {
+			if x-y > 0 {
+				return 1
+			} else if x-y == 0 {
+				return 0
+			}
+			return -1
+		}
+		s.cache = interval.NewSearchTree[treeEntry](cmpFn)
 
 		rpkt = &sshFxVersionPacket{
 			Version:    sftpProtocolVersion,
@@ -245,7 +265,7 @@ func handlePacket(s *Server, p orderedRequest) error {
 		// stat the requested file
 		fmt.Fprintf(s.debugStream, "sftp stat packet\n")
 
-		info, err := os.Stat(s.toLocalPath(p.Path))
+		info, err := os.Stat("/mnt/nutanix" + s.toLocalPath(p.Path))
 		rpkt = &sshFxpStatResponse{
 			ID:   p.ID,
 			info: info,
@@ -255,8 +275,8 @@ func handlePacket(s *Server, p orderedRequest) error {
 		}
 	case *sshFxpLstatPacket:
 		// stat the requested file
-		fmt.Fprintf(s.debugStream, "sftp lstat packet\n")
-		info, err := os.Lstat(s.toLocalPath(p.Path))
+		fmt.Fprintf(s.debugStream, "sftp lstat packet: %v\n", s.toLocalPath(p.Path))
+		info, err := os.Lstat("/mnt/nutanix" + s.toLocalPath(p.Path))
 		rpkt = &sshFxpStatResponse{
 			ID:   p.ID,
 			info: info,
@@ -304,6 +324,16 @@ func handlePacket(s *Server, p orderedRequest) error {
 		rpkt = statusFromError(p.ID, err)
 	case *sshFxpClosePacket:
 		fmt.Fprintf(s.debugStream, "sftp close packet\n")
+		fmt.Printf("Cache: %d\n", s.cache.Size())
+		for {
+			treeEntry, ok := s.cache.Min()
+			if !ok {
+				fmt.Println("Breaking")
+				break
+			}
+			s.flushToNfs(treeEntry.startOffset, treeEntry.data)
+			s.cache.Delete(treeEntry.startOffset, treeEntry.endOffset)
+		}
 		s.nfsFile.Close()
 		rpkt = statusFromError(p.ID, s.closeHandle(p.Handle))
 	case *sshFxpReadlinkPacket:
@@ -326,6 +356,7 @@ func handlePacket(s *Server, p orderedRequest) error {
 		f, err := filepath.Abs(s.toLocalPath(p.Path))
 		// fmt.Fprintf(s.debugStream, "sftp realpath is: %v\n", f)
 		f = cleanPath(f)
+		f = "/"
 		fmt.Fprintf(s.debugStream, "sftp realpath cleanpath is: %v\n", f)
 		rpkt = &sshFxpNamePacket{
 			ID: p.ID,
@@ -357,7 +388,7 @@ func handlePacket(s *Server, p orderedRequest) error {
 			}).respond(s)
 		}
 	case *sshFxpReadPacket:
-		fmt.Fprintf(s.debugStream, "sftp read packet\n")
+		// fmt.Printf("sftp read packet for offset: %d of length: %d\n", int(p.Offset), p.Len)
 		var err error = EBADF
 		// f, ok := s.getHandle(p.Handle)
 		// if ok {
@@ -380,6 +411,17 @@ func handlePacket(s *Server, p orderedRequest) error {
 		data := p.getDataSlice(s.pktMgr.alloc, orderID, s.maxTxPacket)
 		s.nfsFile.Seek(int64(p.Offset), io.SeekStart)
 		n, _err := s.nfsFile.Read(data)
+		data = s.replaceReadData(int64(p.Offset), int(p.Len), data)
+		if n == 0 {
+			n = len(data)
+		}
+		// fmt.Printf("Read length: %d\n", n)
+
+		// if p.Len != 16384 || s.count != 0 {
+		// 	s.count -= 1
+		// 	fmt.Printf("Read data: %v\n", data[:n])
+		// }
+
 		// n, _err := f.ReadAt(data, int64(p.Offset))
 		if _err != nil && (_err != io.EOF || n == 0) {
 			err = _err
@@ -392,19 +434,23 @@ func handlePacket(s *Server, p orderedRequest) error {
 		}
 
 		if err != nil {
+			fmt.Println("In Error")
 			rpkt = statusFromError(p.ID, err)
 		}
 
 	case *sshFxpWritePacket:
-		s.nfsFile.Seek(int64(p.Offset), io.SeekStart)
-		_, err := s.nfsFile.Write(p.Data)
+		// fmt.Printf("Received write request on sftp server for offset : %d, data length: %d\n", p.Offset, len(p.Data))
+		// fmt.Printf("Incoming Write: %v\n", p.Data)
+		s.writeToCache(int64(p.Offset), p.Data)
+		// s.nfsFile.Seek(int64(p.Offset), io.SeekStart)
+		// _, err := s.nfsFile.Write(p.Data)
 
 		// f, ok := s.getHandle(p.Handle)
 		// var err error = EBADF
 		// if ok {
 		// 	_, err = f.WriteAt(p.Data, int64(p.Offset))
 		// }
-		rpkt = statusFromError(p.ID, err)
+		rpkt = statusFromError(p.ID, nil)
 	case *sshFxpExtendedPacket:
 		if p.SpecificPacket == nil {
 			rpkt = statusFromError(p.ID, ErrSSHFxOpUnsupported)
@@ -425,6 +471,102 @@ func handlePacket(s *Server, p orderedRequest) error {
 	// fmt.Fprintf(s.debugStream, "sftp response packet id: %v and orderID is: %v\n", rpkt.id(), orderID)
 	s.pktMgr.readyPacket(s.pktMgr.newOrderedResponse(rpkt, orderID))
 	return nil
+}
+
+func (svr *Server) replaceReadData(startOffset int64, length int, data []byte) []byte {
+	endOffset := startOffset + int64(length)
+	// fmt.Printf("startOffset: %d, endOffset: %d\n", startOffset, endOffset)
+	treeEntries, ok := svr.cache.AllIntersections(startOffset, endOffset)
+
+	if len(data) == 0 {
+		data = make([]byte, length)
+	}
+	if ok {
+		// fmt.Printf("Found overlapping entry\n")
+		for _, treeEntry := range treeEntries {
+			entryStartOffset := treeEntry.startOffset
+			entryEndOffset := treeEntry.endOffset
+			// fmt.Printf("entryStartOffset: %d, entryEndOffset: %d\n", entryStartOffset, entryEndOffset)
+
+			if startOffset <= entryStartOffset && entryStartOffset < startOffset+int64(length) {
+				if entryEndOffset >= endOffset {
+					// fmt.Println("In case 1")
+					data = append(data[:(entryStartOffset-startOffset)], treeEntry.data[:(endOffset-entryStartOffset)]...)
+				} else {
+					// fmt.Println("In case 2")
+					data = append(data[:(entryStartOffset-startOffset)], append(treeEntry.data, data[(entryEndOffset-startOffset):]...)...)
+				}
+			} else if entryStartOffset < startOffset && entryEndOffset > startOffset {
+				if entryEndOffset <= endOffset {
+					// fmt.Println("In case 3")
+					data = append(treeEntry.data[(startOffset-entryStartOffset):], data[(entryEndOffset-startOffset):]...)
+				} else {
+					// fmt.Println("In case 4")
+					data = treeEntry.data[(startOffset - entryStartOffset) : (startOffset-entryStartOffset)+int64(length)]
+				}
+
+			}
+		}
+	}
+	return data
+}
+
+func (svr *Server) writeToCache(startOffset int64, data []byte) {
+	endOffset := startOffset + int64(len(data))
+	treeEntries, ok := svr.cache.AllIntersections(startOffset, endOffset)
+	// treeEntriesToDelete
+	var newData []byte
+	newData = data
+	// fmt.Printf("Found %d intersections with offset: %d \n", len(treeEntries), startOffset)
+	// fmt.Printf("Write data: %v\n", data)
+	if ok {
+		for _, treeEntry := range treeEntries {
+			entryStartOffset := treeEntry.startOffset
+			entryEndOffset := treeEntry.endOffset
+			// fmt.Printf("Original data length: %d\n", len(treeEntry.data))
+			// fmt.Printf("Original data: %v\n", treeEntry.data)
+			if startOffset >= entryStartOffset && endOffset <= entryEndOffset {
+				updatedData := append(treeEntry.data[:(startOffset-entryStartOffset)], append(data, treeEntry.data[(endOffset-entryStartOffset):]...)...)
+				treeEntry.data = updatedData
+				// fmt.Printf("Updated treeEntry data: %v\n", treeEntry.data)
+				svr.cache.Insert(entryStartOffset, entryEndOffset, treeEntry)
+				return
+			} else if entryStartOffset >= startOffset && entryEndOffset <= endOffset {
+				svr.cache.Delete(entryStartOffset, entryEndOffset)
+			} else if entryStartOffset < startOffset && entryEndOffset >= startOffset && entryEndOffset <= endOffset {
+				newData = append(treeEntry.data[:(startOffset-entryStartOffset)], data...)
+				startOffset = entryStartOffset
+				svr.cache.Delete(entryStartOffset, entryEndOffset)
+			} else if entryStartOffset >= startOffset && entryStartOffset <= endOffset && entryEndOffset > endOffset {
+				newData = append(data, treeEntry.data[(endOffset-entryStartOffset):]...)
+				svr.cache.Delete(entryStartOffset, entryEndOffset)
+			}
+		}
+	}
+	// fmt.Printf("Length of data is %d \n", len(newData))
+	// fmt.Printf("start offset: %d, end offset: %d\n", startOffset, endOffset)
+	// fmt.Printf("Write data: %v\n", data)
+	if len(newData) >= 4*1024 {
+		svr.flushToNfs(startOffset, newData)
+	} else {
+		// fmt.Println("Inserting")
+
+		// fmt.Printf("cache size: %v\n", svr.cache.Size())
+		t := new(treeEntry)
+		t.startOffset = startOffset
+		t.endOffset = endOffset
+		t.data = make([]byte, len(newData))
+		copy(t.data, newData)
+		// fmt.Printf("data: %v\n", t.data)
+		svr.cache.Insert(startOffset, endOffset, *t)
+	}
+}
+
+func (svr *Server) flushToNfs(writeOffset int64, data []byte) {
+	// fmt.Printf("Flushing offset: %d , data length: %d\n", writeOffset, len(data))
+	// fmt.Printf("data: %v\n", data)
+	svr.nfsFile.Seek(writeOffset, io.SeekStart)
+	svr.nfsFile.Write(data)
 }
 
 // Serve serves SFTP connections until the streams stop or the SFTP subsystem

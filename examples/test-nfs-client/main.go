@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/vmware/go-nfs-client/nfs"
 	"github.com/vmware/go-nfs-client/nfs/rpc"
@@ -31,6 +32,8 @@ func main() {
 	}
 
 	f, _ := v.OpenFile("test.vmdk", 0666)
+	finfo, _ := f.FSInfo()
+	fmt.Println(finfo.WTPref)
 	var osFlags int
 	osFlags |= os.O_RDWR
 	mode := os.FileMode(0o644)
@@ -41,12 +44,25 @@ func main() {
 	const maxCapacity int = 65536 // your required line length
 	buf := make([]byte, maxCapacity)
 	scanner.Buffer(buf, maxCapacity)
-
+	// var totalCallTime time.Duration
+	// totalCallTime = 0
 	for scanner.Scan() {
 		line := scanner.Text()
 		res1 := strings.Split(line, ",")
 		i, _ := strconv.Atoi(res1[1])
 		j, _ := strconv.Atoi(res1[2])
+		// if res1[0] != "read" {
+		// 	// start := time.Now()
+		// 	lf.Seek(0, io.SeekStart)
+		// 	data := make([]byte, j)
+		// 	lf.Read(data)
+		// 	f.Seek(int64(i), io.SeekStart)
+		// 	f.Write(data)
+		// 	// fmt.Println(times)
+		// 	// fmt.Printf("time taken for a NFS call: %v\n", t)
+		// 	// fmt.Printf("time taken for entire process: %v\n", time.Since(start))
+		// 	// totalCallTime += t
+		// }
 		if res1[0] == "read" {
 			f.Seek(int64(i), io.SeekStart)
 			f.Read(make([]byte, j))
@@ -58,4 +74,6 @@ func main() {
 			f.Write(data)
 		}
 	}
+	time.Sleep(10 * time.Second)
+	// fmt.Println(totalCallTime)
 }
