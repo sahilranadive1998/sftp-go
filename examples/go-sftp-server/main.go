@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"time"
 
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
@@ -26,9 +27,11 @@ func main() {
 	flag.BoolVar(&debugStderr, "e", false, "debug to stderr")
 	flag.Parse()
 
+	logFile, _ := os.Create("./log/log_" + time.Now().Format(time.RFC3339) + ".out")
+
 	debugStream := io.Discard
 	if debugStderr {
-		debugStream = os.Stderr
+		debugStream = logFile
 	}
 
 	// An SSH server is represented by a ServerConfig, which holds
@@ -60,7 +63,7 @@ func main() {
 
 	// Once a ServerConfig has been configured, connections can be
 	// accepted.
-	listener, err := net.Listen("tcp", "0.0.0.0:3373")
+	listener, err := net.Listen("tcp", "127.0.0.1:3373")
 	if err != nil {
 		log.Fatal("failed to listen for connection", err)
 	}
@@ -121,6 +124,8 @@ func main() {
 
 			serverOptions := []sftp.ServerOption{
 				sftp.WithDebug(debugStream),
+				sftp.WithMaxTxPacket(64 * 1024),
+				sftp.WithAllocator(),
 			}
 
 			if readOnly {
@@ -146,4 +151,5 @@ func main() {
 			log.Print("sftp client exited session.")
 		}
 	}
+	logFile.Close()
 }
