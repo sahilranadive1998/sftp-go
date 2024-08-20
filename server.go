@@ -192,6 +192,7 @@ type rxPacket struct {
 // Up to N parallel servers
 func (svr *Server) sftpServerWorker(pktChan chan orderedRequest) error {
 	for pkt := range pktChan {
+		start := time.Now()
 		// readonly checks
 		readonly := true
 		switch pkt := pkt.requestPacket.(type) {
@@ -216,6 +217,7 @@ func (svr *Server) sftpServerWorker(pktChan chan orderedRequest) error {
 		if err := handlePacket(svr, pkt); err != nil {
 			return err
 		}
+		fmt.Fprintf(svr.debugStream, "time taken to process packet: %v\n", time.Since(start))
 	}
 	return nil
 }
@@ -228,8 +230,8 @@ func handlePacket(s *Server, p orderedRequest) error {
 	case *sshFxInitPacket:
 		fmt.Fprintf(s.debugStream, "sftp init packet. Setup NFS connection here\n")
 		// We setup the NFS connection here. Later we can parse the url
-		host := "10.96.96.51"
-		target := "/default-container-60322224114917"
+		host := "10.45.130.0"
+		target := "/default-container-17246812063770"
 
 		mount, err := nfs.DialMount(host)
 		if err != nil {
@@ -247,6 +249,7 @@ func handlePacket(s *Server, p orderedRequest) error {
 		// defer v.Close()
 
 		s.nfsTarget = v
+
 		cmpFn := func(x, y int64) int {
 			if x-y > 0 {
 				return 1
@@ -389,6 +392,7 @@ func handlePacket(s *Server, p orderedRequest) error {
 		}
 	case *sshFxpReadPacket:
 		// fmt.Printf("sftp read packet for offset: %d of length: %d\n", int(p.Offset), p.Len)
+		// fmt.Fprintf(s.debugStream, "sftp read packet \n")
 		var err error = EBADF
 		// f, ok := s.getHandle(p.Handle)
 		// if ok {
@@ -405,13 +409,16 @@ func handlePacket(s *Server, p orderedRequest) error {
 		// 		// do not use data[:n:n] here to clamp the capacity, we allocated extra capacity above to avoid reallocations
 		// 	}
 		// }
-
+		start := time.Now()
 		err = nil
 		// p already has the length of read which is being used
 		data := p.getDataSlice(s.pktMgr.alloc, orderID, s.maxTxPacket)
 		s.nfsFile.Seek(int64(p.Offset), io.SeekStart)
 		n, _err := s.nfsFile.Read(data)
+		fmt.Fprintf(s.debugStream, "NFS,read:%v\n", time.Since(start).Nanoseconds())
+		start = time.Now()
 		data = s.replaceReadData(int64(p.Offset), int(p.Len), data)
+		fmt.Fprintf(s.debugStream, "Cache,read:%v\n", time.Since(start).Nanoseconds())
 		if n == 0 {
 			n = len(data)
 		}
@@ -441,7 +448,9 @@ func handlePacket(s *Server, p orderedRequest) error {
 	case *sshFxpWritePacket:
 		// fmt.Printf("Received write request on sftp server for offset : %d, data length: %d\n", p.Offset, len(p.Data))
 		// fmt.Printf("Incoming Write: %v\n", p.Data)
+		// fmt.Fprintf(s.debugStream, "sftp write packet \n")
 		s.writeToCache(int64(p.Offset), p.Data)
+
 		// s.nfsFile.Seek(int64(p.Offset), io.SeekStart)
 		// _, err := s.nfsFile.Write(p.Data)
 
@@ -512,6 +521,7 @@ func (svr *Server) replaceReadData(startOffset int64, length int, data []byte) [
 }
 
 func (svr *Server) writeToCache(startOffset int64, data []byte) {
+	start := time.Now()
 	endOffset := startOffset + int64(len(data))
 	treeEntries, ok := svr.cache.AllIntersections(startOffset, endOffset)
 	// treeEntriesToDelete
@@ -530,6 +540,7 @@ func (svr *Server) writeToCache(startOffset int64, data []byte) {
 				treeEntry.data = updatedData
 				// fmt.Printf("Updated treeEntry data: %v\n", treeEntry.data)
 				svr.cache.Insert(entryStartOffset, entryEndOffset, treeEntry)
+				fmt.Fprintf(svr.debugStream, "Cache,overwrite:%v\n", time.Since(start).Nanoseconds())
 				return
 			} else if entryStartOffset >= startOffset && entryEndOffset <= endOffset {
 				svr.cache.Delete(entryStartOffset, entryEndOffset)
@@ -548,6 +559,7 @@ func (svr *Server) writeToCache(startOffset int64, data []byte) {
 	// fmt.Printf("Write data: %v\n", data)
 	if len(newData) >= 4*1024 {
 		svr.flushToNfs(startOffset, newData)
+		fmt.Fprintf(svr.debugStream, "NFS,write:%v\n", time.Since(start).Nanoseconds())
 	} else {
 		// fmt.Println("Inserting")
 
@@ -559,6 +571,7 @@ func (svr *Server) writeToCache(startOffset int64, data []byte) {
 		copy(t.data, newData)
 		// fmt.Printf("data: %v\n", t.data)
 		svr.cache.Insert(startOffset, endOffset, *t)
+		fmt.Fprintf(svr.debugStream, "Cache,write:%v\n", time.Since(start).Nanoseconds())
 	}
 }
 

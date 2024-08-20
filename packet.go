@@ -18,7 +18,7 @@ var (
 )
 
 const (
-	maxMsgLength           = 256 * 1024
+	maxMsgLength           = 256 * 1024 * 1024
 	debugDumpTxPacket      = false
 	debugDumpRxPacket      = false
 	debugDumpTxPacketBytes = false

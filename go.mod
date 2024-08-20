@@ -9,6 +9,7 @@ require (
 	github.com/rdleal/intervalst v1.4.0
 	github.com/stretchr/testify v1.9.0
 	github.com/vmware/go-nfs-client v0.0.0-20190605212624-d43b92724c1b
+	github.com/willscott/go-nfs-client v0.0.0-20240104095149-b44639837b00
 	golang.org/x/crypto v0.26.0
 )
 
