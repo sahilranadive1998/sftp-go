@@ -26,11 +26,10 @@ func main() {
 	flag.BoolVar(&readOnly, "R", false, "read-only server")
 	flag.BoolVar(&debugStderr, "e", false, "debug to stderr")
 	flag.Parse()
-
-	logFile, _ := os.Create("./log/log_" + time.Now().Format(time.RFC3339) + ".out")
-
+	var logFile *os.File
 	debugStream := io.Discard
 	if debugStderr {
+		logFile, _ := os.Create("./log/log_" + time.Now().Format(time.RFC3339) + ".out")
 		debugStream = logFile
 	}
 

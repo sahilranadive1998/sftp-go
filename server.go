@@ -36,6 +36,8 @@ type treeEntry struct {
 	data        []byte
 }
 
+var wg2 sync.WaitGroup
+
 type Server struct {
 	*serverConn
 	debugStream   io.Writer
@@ -222,6 +224,46 @@ func (svr *Server) sftpServerWorker(pktChan chan orderedRequest) error {
 	return nil
 }
 
+// func nfsManager(f *nfs.File) {
+// 	defer wg.Done()
+// 	// Loop:
+// 	for {
+// 		if queue.Size() == 0 {
+// 			continue
+// 		}
+// 		item := queue.Dequeue()
+
+// 		if item.offset == -1 {
+// 			break
+// 		}
+// 		if item.length != 0 {
+// 			data := make([]byte, item.length, item.length+13)
+// 			f.Seek(item.offset, io.SeekStart)
+// 			f.Read(data)
+// 			// fmt.Fprintf(s.debugStream, "Read data 1 at offset: %d, of length %d is:%v\n", item.offset, len(data), data)
+// 			readData = data
+// 		} else {
+// 			// fmt.Fprintf(s.debugStream, "Write data at offset: %d, of length %d is:%v\n", item.offset, len(*item.data), *item.data)
+// 			f.Seek(item.offset, io.SeekStart)
+// 			f.Write(*item.data)
+// 		}
+
+// 		// switch item.(type) {
+// 		// case int:
+// 		// 	break Loop
+// 		// default:
+// 		// 	// Do the thing here
+
+// 		// }
+// 		// if item == nil {
+// 		//     // Exit when the queue is empty
+// 		//     break
+// 		// }
+// 		// fmt.Println("Consumer", "Dequeue:", item)
+// 		// time.Sleep(time.Millisecond * 150) // Simulate some work
+// 	}
+// }
+
 func handlePacket(s *Server, p orderedRequest) error {
 	var rpkt responsePacket
 	// fmt.Fprintf(s.debugStream, "sftp request packet type %v\n", p.requestPacket)
@@ -334,9 +376,15 @@ func handlePacket(s *Server, p orderedRequest) error {
 				fmt.Println("Breaking")
 				break
 			}
-			s.flushToNfs(treeEntry.startOffset, treeEntry.data)
+			wg2.Wait()
+			wg2.Add(1)
+			go s.flushToNfs(treeEntry.startOffset, treeEntry.data)
 			s.cache.Delete(treeEntry.startOffset, treeEntry.endOffset)
 		}
+		wg2.Wait()
+		// emptySlice := make([]byte, 0)
+		// queue.Enqueue(&Data{-1, 0, &emptySlice})
+		// wg.Wait()
 		s.nfsFile.Close()
 		rpkt = statusFromError(p.ID, s.closeHandle(p.Handle))
 	case *sshFxpReadlinkPacket:
@@ -412,16 +460,34 @@ func handlePacket(s *Server, p orderedRequest) error {
 		start := time.Now()
 		err = nil
 		// p already has the length of read which is being used
-		data := p.getDataSlice(s.pktMgr.alloc, orderID, s.maxTxPacket)
-		s.nfsFile.Seek(int64(p.Offset), io.SeekStart)
-		n, _err := s.nfsFile.Read(data)
-		fmt.Fprintf(s.debugStream, "NFS,read:%v\n", time.Since(start).Nanoseconds())
-		start = time.Now()
-		data = s.replaceReadData(int64(p.Offset), int(p.Len), data)
-		fmt.Fprintf(s.debugStream, "Cache,read:%v\n", time.Since(start).Nanoseconds())
-		if n == 0 {
-			n = len(data)
+		var data []byte
+		data, found := s.readBeforeNfs(int64(p.Offset), int(p.Len))
+
+		if !found {
+			wg2.Wait()
+			data = p.getDataSlice(s.pktMgr.alloc, orderID, s.maxTxPacket)
+			s.nfsFile.Seek(int64(p.Offset), io.SeekStart)
+			n, _err := s.nfsFile.Read(data)
+			// for {
+			// 	if queue.Size() == 0 && readData != nil {
+			// 		break
+			// 	}
+			// }
+			// s.nfsFile.Seek(int64(p.Offset), io.SeekStart)
+			// n, _err := s.nfsFile.Read(data)
+			fmt.Fprintf(s.debugStream, "NFS,read:%v\n", time.Since(start).Nanoseconds())
+			start = time.Now()
+			data = s.replaceReadData(int64(p.Offset), int(p.Len), data)
+			// fmt.Fprintf(s.debugStream, "Read data at offset: %d, of length %d is:%v\n", p.Offset, len(s.readData), s.readData)
+			fmt.Fprintf(s.debugStream, "Cache,read:%v\n", time.Since(start).Nanoseconds())
+			if n == 0 {
+				n = len(data)
+			}
+			if _err != nil && (_err != io.EOF || n == 0) {
+				err = _err
+			}
 		}
+
 		// fmt.Printf("Read length: %d\n", n)
 
 		// if p.Len != 16384 || s.count != 0 {
@@ -430,13 +496,11 @@ func handlePacket(s *Server, p orderedRequest) error {
 		// }
 
 		// n, _err := f.ReadAt(data, int64(p.Offset))
-		if _err != nil && (_err != io.EOF || n == 0) {
-			err = _err
-		}
+
 		rpkt = &sshFxpDataPacket{
 			ID:     p.ID,
-			Length: uint32(n),
-			Data:   data[:n],
+			Length: uint32(len(data)),
+			Data:   data[:len(data)],
 			// do not use data[:n:n] here to clamp the capacity, we allocated extra capacity above to avoid reallocations
 		}
 
@@ -480,6 +544,24 @@ func handlePacket(s *Server, p orderedRequest) error {
 	// fmt.Fprintf(s.debugStream, "sftp response packet id: %v and orderID is: %v\n", rpkt.id(), orderID)
 	s.pktMgr.readyPacket(s.pktMgr.newOrderedResponse(rpkt, orderID))
 	return nil
+}
+
+func (svr *Server) readBeforeNfs(startOffset int64, length int) ([]byte, bool) {
+	endOffset := startOffset + int64(length)
+	treeEntries, _ := svr.cache.AllIntersections(startOffset, endOffset)
+	var data []byte
+	if len(treeEntries) == 1 {
+		entryStartOffset := treeEntries[0].startOffset
+		entryEndOffset := treeEntries[0].endOffset
+
+		if entryStartOffset <= startOffset && entryEndOffset >= endOffset {
+			data = make([]byte, length)
+			copy(data, treeEntries[0].data[(startOffset-entryStartOffset):(startOffset-entryStartOffset+int64(length))])
+			return data, true
+		}
+
+	}
+	return data, false
 }
 
 func (svr *Server) replaceReadData(startOffset int64, length int, data []byte) []byte {
@@ -558,7 +640,9 @@ func (svr *Server) writeToCache(startOffset int64, data []byte) {
 	// fmt.Printf("start offset: %d, end offset: %d\n", startOffset, endOffset)
 	// fmt.Printf("Write data: %v\n", data)
 	if len(newData) >= 4*1024 {
-		svr.flushToNfs(startOffset, newData)
+		wg2.Wait()
+		wg2.Add(1)
+		go svr.flushToNfs(startOffset, newData)
 		fmt.Fprintf(svr.debugStream, "NFS,write:%v\n", time.Since(start).Nanoseconds())
 	} else {
 		// fmt.Println("Inserting")
@@ -576,6 +660,7 @@ func (svr *Server) writeToCache(startOffset int64, data []byte) {
 }
 
 func (svr *Server) flushToNfs(writeOffset int64, data []byte) {
+	defer wg2.Done()
 	// fmt.Printf("Flushing offset: %d , data length: %d\n", writeOffset, len(data))
 	// fmt.Printf("data: %v\n", data)
 	svr.nfsFile.Seek(writeOffset, io.SeekStart)
@@ -737,7 +822,8 @@ func (p *sshFxpOpenPacket) respond(svr *Server) responsePacket {
 		fmt.Fprintln(svr.debugStream, err.Error())
 	}
 	svr.nfsFile = f
-
+	// wg.Add(1)
+	// go nfsManager(svr.nfsFile)
 	// f, err := os.OpenFile(svr.toLocalPath(p.Path), osFlags, mode)
 	// if err != nil {
 	// 	return statusFromError(p.ID, err)
