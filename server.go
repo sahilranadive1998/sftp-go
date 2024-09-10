@@ -36,7 +36,7 @@ type treeEntry struct {
 	data        []byte
 }
 
-var wg2 sync.WaitGroup
+// var wg2 sync.WaitGroup
 
 type Server struct {
 	*serverConn
@@ -46,12 +46,14 @@ type Server struct {
 	openFiles     map[string]*os.File
 	nfsFile       *nfs.File
 	nfsTarget     *nfs.Target
+	nfsFileSize   int64
 	openFilesLock sync.RWMutex
 	handleCount   int
 	workDir       string
 	maxTxPacket   uint32
 	cache         *interval.SearchTree[treeEntry, int64]
 	count         int
+	wg2           sync.WaitGroup
 }
 
 func (svr *Server) nextHandle(f *os.File) string {
@@ -272,7 +274,7 @@ func handlePacket(s *Server, p orderedRequest) error {
 	case *sshFxInitPacket:
 		fmt.Fprintf(s.debugStream, "sftp init packet. Setup NFS connection here\n")
 		// We setup the NFS connection here. Later we can parse the url
-		host := "10.45.130.0"
+		host := "127.0.0.1"
 		target := "/default-container-17246812063770"
 
 		mount, err := nfs.DialMount(host)
@@ -334,23 +336,23 @@ func handlePacket(s *Server, p orderedRequest) error {
 		var packetId uint32
 
 		packetId = p.id()
-		info2, err := s.nfsFile.FSInfo()
-		fmt.Fprintf(s.debugStream, "Opened nfs file stats: %v\n", info2)
-
-		f, _ := s.getHandle(p.Handle)
+		// info2, err := s.nfsFile.FSInfo()
+		// fmt.Fprintf(s.debugStream, "Opened nfs file stats: %v\n", info2)
+		// f, _ := s.getHandle(p.Handle)
 		// var err error = EBADF
 		var info os.FileInfo
-		if err == nil {
-			info, err = f.Stat()
-			fmt.Fprintf(s.debugStream, "Opened local file stats: %v\n", info)
-			rpkt = &sshFxpStatResponse{
-				ID:   packetId,
-				info: info,
-			}
+		// if err == nil {
+		info = MyFileInfo{size: int64(s.nfsFileSize), mode: 0666, isDir: false}
+		// info, err = f.Stat()
+		fmt.Fprintf(s.debugStream, "Opened file stats: %v\n", info)
+		rpkt = &sshFxpStatResponse{
+			ID:   packetId,
+			info: info,
 		}
-		if err != nil {
-			rpkt = statusFromError(p.ID, err)
-		}
+		// }
+		// if err != nil {
+		// 	rpkt = statusFromError(p.ID, err)
+		// }
 	case *sshFxpMkdirPacket:
 		// TODO FIXME: ignore flags field
 		err := os.Mkdir(s.toLocalPath(p.Path), 0o755)
@@ -376,12 +378,12 @@ func handlePacket(s *Server, p orderedRequest) error {
 				fmt.Println("Breaking")
 				break
 			}
-			wg2.Wait()
-			wg2.Add(1)
+			s.wg2.Wait()
+			s.wg2.Add(1)
 			go s.flushToNfs(treeEntry.startOffset, treeEntry.data)
 			s.cache.Delete(treeEntry.startOffset, treeEntry.endOffset)
 		}
-		wg2.Wait()
+		s.wg2.Wait()
 		// emptySlice := make([]byte, 0)
 		// queue.Enqueue(&Data{-1, 0, &emptySlice})
 		// wg.Wait()
@@ -464,7 +466,7 @@ func handlePacket(s *Server, p orderedRequest) error {
 		data, found := s.readBeforeNfs(int64(p.Offset), int(p.Len))
 
 		if !found {
-			wg2.Wait()
+			s.wg2.Wait()
 			data = p.getDataSlice(s.pktMgr.alloc, orderID, s.maxTxPacket)
 			s.nfsFile.Seek(int64(p.Offset), io.SeekStart)
 			n, _err := s.nfsFile.Read(data)
@@ -534,6 +536,8 @@ func handlePacket(s *Server, p orderedRequest) error {
 		fmt.Fprintf(s.debugStream, "sftp open packet\n")
 		rpkt = p.respond(s)
 		fmt.Fprintf(s.debugStream, "Open file handle: %v\n", s.nfsFile)
+		fmt.Fprintf(s.debugStream, "Open file attr: %v\n", s.nfsFile.FsInfoFile)
+		fmt.Fprintf(s.debugStream, "Open target file attr: %v\n", s.nfsTarget.Fsinfo)
 	case serverRespondablePacket:
 		fmt.Fprintf(s.debugStream, "sftp respondable packet\n")
 		rpkt = p.respond(s)
@@ -640,8 +644,8 @@ func (svr *Server) writeToCache(startOffset int64, data []byte) {
 	// fmt.Printf("start offset: %d, end offset: %d\n", startOffset, endOffset)
 	// fmt.Printf("Write data: %v\n", data)
 	if len(newData) >= 4*1024 {
-		wg2.Wait()
-		wg2.Add(1)
+		svr.wg2.Wait()
+		svr.wg2.Add(1)
 		go svr.flushToNfs(startOffset, newData)
 		fmt.Fprintf(svr.debugStream, "NFS,write:%v\n", time.Since(start).Nanoseconds())
 	} else {
@@ -660,7 +664,7 @@ func (svr *Server) writeToCache(startOffset int64, data []byte) {
 }
 
 func (svr *Server) flushToNfs(writeOffset int64, data []byte) {
-	defer wg2.Done()
+	defer svr.wg2.Done()
 	// fmt.Printf("Flushing offset: %d , data length: %d\n", writeOffset, len(data))
 	// fmt.Printf("data: %v\n", data)
 	svr.nfsFile.Seek(writeOffset, io.SeekStart)
@@ -815,6 +819,18 @@ func (p *sshFxpOpenPacket) respond(svr *Server) responsePacket {
 	fmt.Fprintf(svr.debugStream, "Path in packet: %v\n", p.Path)
 	path := svr.toLocalPath(p.Path)
 	fmt.Fprintln(svr.debugStream, path)
+
+	fileSize, err := determineFileSize(svr, path)
+	if err != nil {
+		fmt.Fprintln(svr.debugStream, "Error")
+		fmt.Fprintln(svr.debugStream, err.Error())
+		return statusFromError(p.ID, err)
+	}
+
+	fmt.Fprintf(svr.debugStream, "Determined file size is: %v\n", fileSize)
+
+	svr.nfsFileSize = fileSize
+
 	f, err := svr.nfsTarget.OpenFile(path, 0666)
 
 	if err != nil {
@@ -832,6 +848,33 @@ func (p *sshFxpOpenPacket) respond(svr *Server) responsePacket {
 	handle := p.respondOld(svr)
 	fmt.Fprintf(svr.debugStream, "handle: %v\n", handle)
 	return &sshFxpHandlePacket{ID: p.ID, Handle: handle}
+}
+
+func determineFileSize(svr *Server, path string) (int64, error) {
+	file, err := svr.nfsTarget.OpenFile(path, 0666)
+	if err != nil {
+		fmt.Println("Error opening file:", err)
+		return 0, err
+	}
+	defer file.Close()
+
+	var fileSize int64 = 0
+	buffer := make([]byte, 1024*4) // Create a buffer to hold chunks of the file
+	var bytesRead int
+	for {
+		// Read the file in chunks
+		bytesRead, err = file.Read(buffer)
+		if err != nil {
+			if err == io.EOF {
+				break // End of file reached
+			}
+			fmt.Println("Error reading file:", err)
+			return 0, err
+		}
+		fileSize += int64(bytesRead)
+	}
+	fileSize += int64(bytesRead)
+	return fileSize, nil
 }
 
 func (p *sshFxpOpenPacket) respondOld(svr *Server) string {
@@ -873,7 +916,7 @@ func (p *sshFxpOpenPacket) respondOld(svr *Server) string {
 		mode = fs.FileMode() & os.ModePerm
 	}
 	fmt.Fprintf(svr.debugStream, "local path file: %v\n", svr.toLocalPath(p.Path))
-	f, err := os.OpenFile("/mnt/nutanix"+svr.toLocalPath(p.Path), osFlags, mode)
+	f, err := os.OpenFile("/home/nutanix/sahil2"+svr.toLocalPath(p.Path), osFlags, mode)
 	if err != nil {
 		return "this is the issue\n"
 		// return statusFromError(p.ID, err)
