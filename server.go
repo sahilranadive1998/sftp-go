@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -274,25 +275,25 @@ func handlePacket(s *Server, p orderedRequest) error {
 	case *sshFxInitPacket:
 		fmt.Fprintf(s.debugStream, "sftp init packet. Setup NFS connection here\n")
 		// We setup the NFS connection here. Later we can parse the url
-		host := "127.0.0.1"
-		target := "/default-container-17246812063770"
+		// host := "127.0.0.1"
+		// target := "/default-container-17246812063770"
 
-		mount, err := nfs.DialMount(host)
-		if err != nil {
-			fmt.Fprint(s.debugStream, err.Error())
-		}
-		// defer mount.Close()
+		// mount, err := nfs.DialMount(host)
+		// if err != nil {
+		// 	fmt.Fprint(s.debugStream, err.Error())
+		// }
+		// // defer mount.Close()
 
-		hostname, _ := os.Hostname()
-		auth := rpc.NewAuthUnix(hostname, 1000, 1000)
+		// hostname, _ := os.Hostname()
+		// auth := rpc.NewAuthUnix(hostname, 1000, 1000)
 
-		v, err := mount.Mount(target, auth.Auth())
-		if err != nil {
-			fmt.Fprint(s.debugStream, err.Error())
-		}
-		// defer v.Close()
+		// v, err := mount.Mount(target, auth.Auth())
+		// if err != nil {
+		// 	fmt.Fprint(s.debugStream, err.Error())
+		// }
+		// // defer v.Close()
 
-		s.nfsTarget = v
+		// s.nfsTarget = v
 
 		cmpFn := func(x, y int64) int {
 			if x-y > 0 {
@@ -372,16 +373,16 @@ func handlePacket(s *Server, p orderedRequest) error {
 	case *sshFxpClosePacket:
 		fmt.Fprintf(s.debugStream, "sftp close packet\n")
 		fmt.Printf("Cache: %d\n", s.cache.Size())
-		for {
-			treeEntry, ok := s.cache.Min()
-			if !ok {
-				fmt.Println("Breaking")
-				break
-			}
-			s.wg2.Wait()
-			s.wg2.Add(1)
-			go s.flushToNfs(treeEntry.startOffset, treeEntry.data)
-			s.cache.Delete(treeEntry.startOffset, treeEntry.endOffset)
+		for s.evictMinEntry() {
+			// treeEntry, ok := s.cache.Min()
+			// if !ok {
+			// 	fmt.Println("Breaking")
+			// 	break
+			// }
+			// s.wg2.Wait()
+			// s.wg2.Add(1)
+			// s.flushToNfs(treeEntry.startOffset, treeEntry.data)
+			// s.cache.Delete(treeEntry.startOffset, treeEntry.endOffset)
 		}
 		s.wg2.Wait()
 		// emptySlice := make([]byte, 0)
@@ -536,8 +537,8 @@ func handlePacket(s *Server, p orderedRequest) error {
 		fmt.Fprintf(s.debugStream, "sftp open packet\n")
 		rpkt = p.respond(s)
 		fmt.Fprintf(s.debugStream, "Open file handle: %v\n", s.nfsFile)
-		fmt.Fprintf(s.debugStream, "Open file attr: %v\n", s.nfsFile.FsInfoFile)
-		fmt.Fprintf(s.debugStream, "Open target file attr: %v\n", s.nfsTarget.Fsinfo)
+		// fmt.Fprintf(s.debugStream, "Open file attr: %v\n", s.nfsFile.FsInfoFile)
+		// fmt.Fprintf(s.debugStream, "Open target file attr: %v\n", s.nfsTarget.Fsinfo)
 	case serverRespondablePacket:
 		fmt.Fprintf(s.debugStream, "sftp respondable packet\n")
 		rpkt = p.respond(s)
@@ -646,12 +647,15 @@ func (svr *Server) writeToCache(startOffset int64, data []byte) {
 	if len(newData) >= 4*1024 {
 		svr.wg2.Wait()
 		svr.wg2.Add(1)
-		go svr.flushToNfs(startOffset, newData)
+		svr.flushToNfs(startOffset, newData)
 		fmt.Fprintf(svr.debugStream, "NFS,write:%v\n", time.Since(start).Nanoseconds())
 	} else {
 		// fmt.Println("Inserting")
 
 		// fmt.Printf("cache size: %v\n", svr.cache.Size())
+		if svr.cache.Size() == 128 {
+			_ = svr.evictMinEntry()
+		}
 		t := new(treeEntry)
 		t.startOffset = startOffset
 		t.endOffset = endOffset
@@ -669,6 +673,19 @@ func (svr *Server) flushToNfs(writeOffset int64, data []byte) {
 	// fmt.Printf("data: %v\n", data)
 	svr.nfsFile.Seek(writeOffset, io.SeekStart)
 	svr.nfsFile.Write(data)
+}
+
+func (svr *Server) evictMinEntry() bool {
+	treeEntry, ok := svr.cache.Min()
+	if !ok {
+		fmt.Println("Cache is empty")
+		return false
+	}
+	svr.wg2.Wait()
+	svr.wg2.Add(1)
+	svr.flushToNfs(treeEntry.startOffset, treeEntry.data)
+	svr.cache.Delete(treeEntry.startOffset, treeEntry.endOffset)
+	return true
 }
 
 // Serve serves SFTP connections until the streams stop or the SFTP subsystem
@@ -820,7 +837,31 @@ func (p *sshFxpOpenPacket) respond(svr *Server) responsePacket {
 	path := svr.toLocalPath(p.Path)
 	fmt.Fprintln(svr.debugStream, path)
 
-	fileSize, err := determineFileSize(svr, path)
+	host := "10.45.129.247"
+	// target := "/default-container-17246812063770"
+	target := "/" + strings.Split(p.Path, "/")[1]
+	modifiedPath := strings.Split(p.Path, target)[1]
+	fmt.Println(target)
+	fmt.Println(modifiedPath)
+
+	mount, err := nfs.DialMount(host)
+	if err != nil {
+		fmt.Fprint(svr.debugStream, err.Error())
+	}
+	// defer mount.Close()
+
+	hostname, _ := os.Hostname()
+	auth := rpc.NewAuthUnix(hostname, 1000, 1000)
+
+	v, err := mount.Mount(target, auth.Auth())
+	if err != nil {
+		fmt.Fprint(svr.debugStream, err.Error())
+	}
+	// defer v.Close()
+
+	svr.nfsTarget = v
+
+	fileSize, err := determineFileSize(svr, modifiedPath)
 	if err != nil {
 		fmt.Fprintln(svr.debugStream, "Error")
 		fmt.Fprintln(svr.debugStream, err.Error())
@@ -831,7 +872,7 @@ func (p *sshFxpOpenPacket) respond(svr *Server) responsePacket {
 
 	svr.nfsFileSize = fileSize
 
-	f, err := svr.nfsTarget.OpenFile(path, 0666)
+	f, err := svr.nfsTarget.OpenFile(modifiedPath, 0666)
 
 	if err != nil {
 		fmt.Fprintln(svr.debugStream, "Error")
@@ -845,7 +886,8 @@ func (p *sshFxpOpenPacket) respond(svr *Server) responsePacket {
 	// 	return statusFromError(p.ID, err)
 	// }
 
-	handle := p.respondOld(svr)
+	var dummyFile *os.File = nil
+	handle := svr.nextHandle(dummyFile)
 	fmt.Fprintf(svr.debugStream, "handle: %v\n", handle)
 	return &sshFxpHandlePacket{ID: p.ID, Handle: handle}
 }
@@ -878,14 +920,14 @@ func determineFileSize(svr *Server, path string) (int64, error) {
 }
 
 func (p *sshFxpOpenPacket) respondOld(svr *Server) string {
-	var osFlags int
-	if p.hasPflags(sshFxfRead, sshFxfWrite) {
-		osFlags |= os.O_RDWR
-	} else if p.hasPflags(sshFxfWrite) {
-		osFlags |= os.O_WRONLY
-	} else if p.hasPflags(sshFxfRead) {
-		osFlags |= os.O_RDONLY
-	}
+	// var osFlags int
+	// if p.hasPflags(sshFxfRead, sshFxfWrite) {
+	// 	osFlags |= os.O_RDWR
+	// } else if p.hasPflags(sshFxfWrite) {
+	// 	osFlags |= os.O_WRONLY
+	// } else if p.hasPflags(sshFxfRead) {
+	// 	osFlags |= os.O_RDONLY
+	// }
 	// } else {
 	// 	// how are they opening?
 	// 	return statusFromError(p.ID, syscall.EINVAL)
@@ -894,34 +936,35 @@ func (p *sshFxpOpenPacket) respondOld(svr *Server) string {
 	// Don't use O_APPEND flag as it conflicts with WriteAt.
 	// The sshFxfAppend flag is a no-op here as the client sends the offsets.
 
-	if p.hasPflags(sshFxfCreat) {
-		osFlags |= os.O_CREATE
-	}
-	if p.hasPflags(sshFxfTrunc) {
-		osFlags |= os.O_TRUNC
-	}
-	if p.hasPflags(sshFxfExcl) {
-		osFlags |= os.O_EXCL
-	}
+	// if p.hasPflags(sshFxfCreat) {
+	// 	osFlags |= os.O_CREATE
+	// }
+	// if p.hasPflags(sshFxfTrunc) {
+	// 	osFlags |= os.O_TRUNC
+	// }
+	// if p.hasPflags(sshFxfExcl) {
+	// 	osFlags |= os.O_EXCL
+	// }
 
-	mode := os.FileMode(0o644)
+	// mode := os.FileMode(0o644)
 	// Like OpenSSH, we only handle permissions here, and only when the file is being created.
 	// Otherwise, the permissions are ignored.
-	if p.Flags&sshFileXferAttrPermissions != 0 {
-		fs, err := p.unmarshalFileStat(p.Flags)
-		if err != nil {
-			return ""
-			// return statusFromError(p.ID, err)
-		}
-		mode = fs.FileMode() & os.ModePerm
-	}
-	fmt.Fprintf(svr.debugStream, "local path file: %v\n", svr.toLocalPath(p.Path))
-	f, err := os.OpenFile("/home/nutanix/sahil2"+svr.toLocalPath(p.Path), osFlags, mode)
-	if err != nil {
-		return "this is the issue\n"
-		// return statusFromError(p.ID, err)
-	}
-
+	// if p.Flags&sshFileXferAttrPermissions != 0 {
+	// 	fs, err := p.unmarshalFileStat(p.Flags)
+	// 	if err != nil {
+	// 		return ""
+	// 		// return statusFromError(p.ID, err)
+	// 	}
+	// 	mode = fs.FileMode() & os.ModePerm
+	// }
+	// fmt.Fprintf(svr.debugStream, "local path file: %v\n", svr.toLocalPath(p.Path))
+	// f, err := os.OpenFile("/home/nutanix/sahil2"+svr.toLocalPath(p.Path), osFlags, mode)
+	// if err != nil {
+	// 	return "this is the issue\n"
+	// 	// return statusFromError(p.ID, err)
+	// }
+	var f *os.File = nil
+	// TODO: This needs to be removed and no local file should be created
 	return svr.nextHandle(f)
 	// return &sshFxpHandlePacket{ID: p.ID, Handle: handle}
 }

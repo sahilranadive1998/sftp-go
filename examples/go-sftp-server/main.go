@@ -12,6 +12,9 @@ import (
 	"os"
 	"time"
 
+	// "net/http"
+	// _ "net/http/pprof" // Import for side effect to register pprof handlers
+
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 )
@@ -22,6 +25,7 @@ func main() {
 		readOnly    bool
 		debugStderr bool
 	)
+	var activeConns = 0
 
 	flag.BoolVar(&readOnly, "R", false, "read-only server")
 	flag.BoolVar(&debugStderr, "e", false, "debug to stderr")
@@ -32,6 +36,11 @@ func main() {
 		logFile, _ := os.Create("./log/log_" + time.Now().Format(time.RFC3339) + ".out")
 		debugStream = logFile
 	}
+
+	// Start HTTP server with pprof enabled
+	// go func() {
+	// 	http.ListenAndServe("localhost:6060", nil)
+	// }()
 
 	// An SSH server is represented by a ServerConfig, which holds
 	// certificate details and handles authentication of ServerConns.
@@ -68,6 +77,9 @@ func main() {
 	}
 	fmt.Printf("Listening on %v\n", listener.Addr())
 
+	// Run the timer in the background as a goroutine
+	go startBackgroundTimer(&activeConns)
+
 	// Accept multiple incoming connections
 	for {
 		nConn, err := listener.Accept()
@@ -77,9 +89,9 @@ func main() {
 		}
 
 		// Handle each connection in a separate goroutine
-		go handleConnection(nConn, config, readOnly, debugStream)
+		go handleConnection(nConn, config, readOnly, debugStream, &activeConns)
 	}
-
+	logFile.Close()
 	// for {
 	// 	nConn, err := listener.Accept()
 	// 	if err != nil {
@@ -162,11 +174,10 @@ func main() {
 	// 		log.Print("sftp client exited session.")
 	// 	}
 	// }
-	logFile.Close()
 }
 
 // handleConnection handles a single SSH/SFTP connection.
-func handleConnection(nConn net.Conn, config *ssh.ServerConfig, readOnly bool, debugStream io.Writer) {
+func handleConnection(nConn net.Conn, config *ssh.ServerConfig, readOnly bool, debugStream io.Writer, activeConns *int) {
 	defer nConn.Close()
 
 	// Perform SSH handshake
@@ -204,7 +215,6 @@ func handleConnection(nConn net.Conn, config *ssh.ServerConfig, readOnly bool, d
 		serverOptions := []sftp.ServerOption{
 			sftp.WithDebug(debugStream),
 			sftp.WithMaxTxPacket(64 * 1024),
-			sftp.WithAllocator(),
 		}
 
 		if readOnly {
@@ -222,7 +232,7 @@ func handleConnection(nConn net.Conn, config *ssh.ServerConfig, readOnly bool, d
 			log.Printf("failed to start SFTP server: %v", err)
 			return
 		}
-
+		*activeConns += 1
 		// Serve the SFTP requests
 		if err := server.Serve(); err != nil {
 			if err != io.EOF {
@@ -230,7 +240,8 @@ func handleConnection(nConn net.Conn, config *ssh.ServerConfig, readOnly bool, d
 			}
 		}
 		server.Close()
-		log.Print("SFTP client exited session.")
+		*activeConns -= 1
+		log.Printf("SFTP client exited session. Conns: %v", *activeConns)
 	}
 }
 
@@ -248,5 +259,35 @@ func handleRequests(in <-chan *ssh.Request, debugStream io.Writer) {
 		}
 		fmt.Fprintf(debugStream, " - accepted: %v\n", ok)
 		req.Reply(ok, nil)
+	}
+}
+
+// Function to monitor the variable in the background
+func startBackgroundTimer(monitoredVar *int) {
+	// Create a timer for 15 minutes
+	exitTimer := time.NewTimer(2 * time.Minute)
+	defer exitTimer.Stop()
+
+	// Create a ticker that checks the variable every minute
+	checkInterval := time.NewTicker(1 * time.Minute)
+	defer checkInterval.Stop()
+
+	for {
+		select {
+		case <-checkInterval.C:
+			// Check if the variable is still 0
+			if *monitoredVar != 0 {
+				// Reset the timer if the variable is not zero
+				exitTimer.Reset(2 * time.Minute)
+				fmt.Println("Variable is not zero, resetting timer.")
+			} else {
+				fmt.Println("Variable is still zero, checking again.")
+			}
+
+		case <-exitTimer.C:
+			// If 15 minutes passed with the variable being 0, exit the program
+			fmt.Println("Exiting because variable was 0 for 15 minutes.")
+			os.Exit(0)
+		}
 	}
 }
