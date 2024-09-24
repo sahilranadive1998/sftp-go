@@ -227,74 +227,12 @@ func (svr *Server) sftpServerWorker(pktChan chan orderedRequest) error {
 	return nil
 }
 
-// func nfsManager(f *nfs.File) {
-// 	defer wg.Done()
-// 	// Loop:
-// 	for {
-// 		if queue.Size() == 0 {
-// 			continue
-// 		}
-// 		item := queue.Dequeue()
-
-// 		if item.offset == -1 {
-// 			break
-// 		}
-// 		if item.length != 0 {
-// 			data := make([]byte, item.length, item.length+13)
-// 			f.Seek(item.offset, io.SeekStart)
-// 			f.Read(data)
-// 			// fmt.Fprintf(s.debugStream, "Read data 1 at offset: %d, of length %d is:%v\n", item.offset, len(data), data)
-// 			readData = data
-// 		} else {
-// 			// fmt.Fprintf(s.debugStream, "Write data at offset: %d, of length %d is:%v\n", item.offset, len(*item.data), *item.data)
-// 			f.Seek(item.offset, io.SeekStart)
-// 			f.Write(*item.data)
-// 		}
-
-// 		// switch item.(type) {
-// 		// case int:
-// 		// 	break Loop
-// 		// default:
-// 		// 	// Do the thing here
-
-// 		// }
-// 		// if item == nil {
-// 		//     // Exit when the queue is empty
-// 		//     break
-// 		// }
-// 		// fmt.Println("Consumer", "Dequeue:", item)
-// 		// time.Sleep(time.Millisecond * 150) // Simulate some work
-// 	}
-// }
-
 func handlePacket(s *Server, p orderedRequest) error {
 	var rpkt responsePacket
-	// fmt.Fprintf(s.debugStream, "sftp request packet type %v\n", p.requestPacket)
 	orderID := p.orderID()
 	switch p := p.requestPacket.(type) {
 	case *sshFxInitPacket:
-		fmt.Fprintf(s.debugStream, "sftp init packet. Setup NFS connection here\n")
-		// We setup the NFS connection here. Later we can parse the url
-		// host := "127.0.0.1"
-		// target := "/default-container-17246812063770"
-
-		// mount, err := nfs.DialMount(host)
-		// if err != nil {
-		// 	fmt.Fprint(s.debugStream, err.Error())
-		// }
-		// // defer mount.Close()
-
-		// hostname, _ := os.Hostname()
-		// auth := rpc.NewAuthUnix(hostname, 1000, 1000)
-
-		// v, err := mount.Mount(target, auth.Auth())
-		// if err != nil {
-		// 	fmt.Fprint(s.debugStream, err.Error())
-		// }
-		// // defer v.Close()
-
-		// s.nfsTarget = v
-
+		fmt.Fprintf(s.debugStream, "Initializing Cache\n")
 		cmpFn := func(x, y int64) int {
 			if x-y > 0 {
 				return 1
@@ -337,23 +275,14 @@ func handlePacket(s *Server, p orderedRequest) error {
 		var packetId uint32
 
 		packetId = p.id()
-		// info2, err := s.nfsFile.FSInfo()
-		// fmt.Fprintf(s.debugStream, "Opened nfs file stats: %v\n", info2)
-		// f, _ := s.getHandle(p.Handle)
-		// var err error = EBADF
 		var info os.FileInfo
-		// if err == nil {
+		// Override fileinfo command from NFS with own FileInfo struct
 		info = MyFileInfo{size: int64(s.nfsFileSize), mode: 0666, isDir: false}
-		// info, err = f.Stat()
 		fmt.Fprintf(s.debugStream, "Opened file stats: %v\n", info)
 		rpkt = &sshFxpStatResponse{
 			ID:   packetId,
 			info: info,
 		}
-		// }
-		// if err != nil {
-		// 	rpkt = statusFromError(p.ID, err)
-		// }
 	case *sshFxpMkdirPacket:
 		// TODO FIXME: ignore flags field
 		err := os.Mkdir(s.toLocalPath(p.Path), 0o755)
@@ -371,23 +300,12 @@ func handlePacket(s *Server, p orderedRequest) error {
 		err := os.Symlink(s.toLocalPath(p.Targetpath), s.toLocalPath(p.Linkpath))
 		rpkt = statusFromError(p.ID, err)
 	case *sshFxpClosePacket:
-		fmt.Fprintf(s.debugStream, "sftp close packet\n")
-		fmt.Printf("Cache: %d\n", s.cache.Size())
+		fmt.Fprintf(s.debugStream, "SFTP Close Packet\n")
+		fmt.Fprintf(s.debugStream, "Cache entries at the end of session: %d\n", s.cache.Size())
 		for s.evictMinEntry() {
-			// treeEntry, ok := s.cache.Min()
-			// if !ok {
-			// 	fmt.Println("Breaking")
-			// 	break
-			// }
-			// s.wg2.Wait()
-			// s.wg2.Add(1)
-			// s.flushToNfs(treeEntry.startOffset, treeEntry.data)
-			// s.cache.Delete(treeEntry.startOffset, treeEntry.endOffset)
 		}
 		s.wg2.Wait()
-		// emptySlice := make([]byte, 0)
-		// queue.Enqueue(&Data{-1, 0, &emptySlice})
-		// wg.Wait()
+		// Close NFS file
 		s.nfsFile.Close()
 		rpkt = statusFromError(p.ID, s.closeHandle(p.Handle))
 	case *sshFxpReadlinkPacket:
@@ -408,7 +326,6 @@ func handlePacket(s *Server, p orderedRequest) error {
 	case *sshFxpRealpathPacket:
 		fmt.Fprintf(s.debugStream, "sftp realpath packet\n")
 		f, err := filepath.Abs(s.toLocalPath(p.Path))
-		// fmt.Fprintf(s.debugStream, "sftp realpath is: %v\n", f)
 		f = cleanPath(f)
 		f = "/"
 		fmt.Fprintf(s.debugStream, "sftp realpath cleanpath is: %v\n", f)
@@ -445,22 +362,7 @@ func handlePacket(s *Server, p orderedRequest) error {
 		// fmt.Printf("sftp read packet for offset: %d of length: %d\n", int(p.Offset), p.Len)
 		// fmt.Fprintf(s.debugStream, "sftp read packet \n")
 		var err error = EBADF
-		// f, ok := s.getHandle(p.Handle)
-		// if ok {
-		// 	err = nil
-		// 	data := p.getDataSlice(s.pktMgr.alloc, orderID, s.maxTxPacket)
-		// 	n, _err := f.ReadAt(data, int64(p.Offset))
-		// 	if _err != nil && (_err != io.EOF || n == 0) {
-		// 		err = _err
-		// 	}
-		// 	rpkt = &sshFxpDataPacket{
-		// 		ID:     p.ID,
-		// 		Length: uint32(n),
-		// 		Data:   data[:n],
-		// 		// do not use data[:n:n] here to clamp the capacity, we allocated extra capacity above to avoid reallocations
-		// 	}
-		// }
-		start := time.Now()
+		// start := time.Now()
 		err = nil
 		// p already has the length of read which is being used
 		var data []byte
@@ -471,18 +373,11 @@ func handlePacket(s *Server, p orderedRequest) error {
 			data = p.getDataSlice(s.pktMgr.alloc, orderID, s.maxTxPacket)
 			s.nfsFile.Seek(int64(p.Offset), io.SeekStart)
 			n, _err := s.nfsFile.Read(data)
-			// for {
-			// 	if queue.Size() == 0 && readData != nil {
-			// 		break
-			// 	}
-			// }
-			// s.nfsFile.Seek(int64(p.Offset), io.SeekStart)
-			// n, _err := s.nfsFile.Read(data)
-			fmt.Fprintf(s.debugStream, "NFS,read:%v\n", time.Since(start).Nanoseconds())
-			start = time.Now()
+			// fmt.Fprintf(s.debugStream, "NFS,read:%v\n", time.Since(start).Nanoseconds())
+			// start = time.Now()
 			data = s.replaceReadData(int64(p.Offset), int(p.Len), data)
 			// fmt.Fprintf(s.debugStream, "Read data at offset: %d, of length %d is:%v\n", p.Offset, len(s.readData), s.readData)
-			fmt.Fprintf(s.debugStream, "Cache,read:%v\n", time.Since(start).Nanoseconds())
+			// fmt.Fprintf(s.debugStream, "Cache,read:%v\n", time.Since(start).Nanoseconds())
 			if n == 0 {
 				n = len(data)
 			}
@@ -490,15 +385,6 @@ func handlePacket(s *Server, p orderedRequest) error {
 				err = _err
 			}
 		}
-
-		// fmt.Printf("Read length: %d\n", n)
-
-		// if p.Len != 16384 || s.count != 0 {
-		// 	s.count -= 1
-		// 	fmt.Printf("Read data: %v\n", data[:n])
-		// }
-
-		// n, _err := f.ReadAt(data, int64(p.Offset))
 
 		rpkt = &sshFxpDataPacket{
 			ID:     p.ID,
@@ -517,15 +403,6 @@ func handlePacket(s *Server, p orderedRequest) error {
 		// fmt.Printf("Incoming Write: %v\n", p.Data)
 		// fmt.Fprintf(s.debugStream, "sftp write packet \n")
 		s.writeToCache(int64(p.Offset), p.Data)
-
-		// s.nfsFile.Seek(int64(p.Offset), io.SeekStart)
-		// _, err := s.nfsFile.Write(p.Data)
-
-		// f, ok := s.getHandle(p.Handle)
-		// var err error = EBADF
-		// if ok {
-		// 	_, err = f.WriteAt(p.Data, int64(p.Offset))
-		// }
 		rpkt = statusFromError(p.ID, nil)
 	case *sshFxpExtendedPacket:
 		if p.SpecificPacket == nil {
@@ -537,16 +414,12 @@ func handlePacket(s *Server, p orderedRequest) error {
 		fmt.Fprintf(s.debugStream, "sftp open packet\n")
 		rpkt = p.respond(s)
 		fmt.Fprintf(s.debugStream, "Open file handle: %v\n", s.nfsFile)
-		// fmt.Fprintf(s.debugStream, "Open file attr: %v\n", s.nfsFile.FsInfoFile)
-		// fmt.Fprintf(s.debugStream, "Open target file attr: %v\n", s.nfsTarget.Fsinfo)
 	case serverRespondablePacket:
 		fmt.Fprintf(s.debugStream, "sftp respondable packet\n")
 		rpkt = p.respond(s)
 	default:
 		return fmt.Errorf("unexpected packet type %T", p)
 	}
-	// fmt.Fprintf(s.debugStream, "sftp response order id: %v\n", rpkt)
-	// fmt.Fprintf(s.debugStream, "sftp response packet id: %v and orderID is: %v\n", rpkt.id(), orderID)
 	s.pktMgr.readyPacket(s.pktMgr.newOrderedResponse(rpkt, orderID))
 	return nil
 }
@@ -586,18 +459,14 @@ func (svr *Server) replaceReadData(startOffset int64, length int, data []byte) [
 
 			if startOffset <= entryStartOffset && entryStartOffset < startOffset+int64(length) {
 				if entryEndOffset >= endOffset {
-					// fmt.Println("In case 1")
 					data = append(data[:(entryStartOffset-startOffset)], treeEntry.data[:(endOffset-entryStartOffset)]...)
 				} else {
-					// fmt.Println("In case 2")
 					data = append(data[:(entryStartOffset-startOffset)], append(treeEntry.data, data[(entryEndOffset-startOffset):]...)...)
 				}
 			} else if entryStartOffset < startOffset && entryEndOffset > startOffset {
 				if entryEndOffset <= endOffset {
-					// fmt.Println("In case 3")
 					data = append(treeEntry.data[(startOffset-entryStartOffset):], data[(entryEndOffset-startOffset):]...)
 				} else {
-					// fmt.Println("In case 4")
 					data = treeEntry.data[(startOffset - entryStartOffset) : (startOffset-entryStartOffset)+int64(length)]
 				}
 
@@ -608,26 +477,18 @@ func (svr *Server) replaceReadData(startOffset int64, length int, data []byte) [
 }
 
 func (svr *Server) writeToCache(startOffset int64, data []byte) {
-	start := time.Now()
 	endOffset := startOffset + int64(len(data))
 	treeEntries, ok := svr.cache.AllIntersections(startOffset, endOffset)
-	// treeEntriesToDelete
-	var newData []byte
-	newData = data
-	// fmt.Printf("Found %d intersections with offset: %d \n", len(treeEntries), startOffset)
-	// fmt.Printf("Write data: %v\n", data)
+	newData := make([]byte, len(data))
+	copy(data, newData)
 	if ok {
 		for _, treeEntry := range treeEntries {
 			entryStartOffset := treeEntry.startOffset
 			entryEndOffset := treeEntry.endOffset
-			// fmt.Printf("Original data length: %d\n", len(treeEntry.data))
-			// fmt.Printf("Original data: %v\n", treeEntry.data)
 			if startOffset >= entryStartOffset && endOffset <= entryEndOffset {
 				updatedData := append(treeEntry.data[:(startOffset-entryStartOffset)], append(data, treeEntry.data[(endOffset-entryStartOffset):]...)...)
 				treeEntry.data = updatedData
-				// fmt.Printf("Updated treeEntry data: %v\n", treeEntry.data)
 				svr.cache.Insert(entryStartOffset, entryEndOffset, treeEntry)
-				fmt.Fprintf(svr.debugStream, "Cache,overwrite:%v\n", time.Since(start).Nanoseconds())
 				return
 			} else if entryStartOffset >= startOffset && entryEndOffset <= endOffset {
 				svr.cache.Delete(entryStartOffset, entryEndOffset)
@@ -641,18 +502,11 @@ func (svr *Server) writeToCache(startOffset int64, data []byte) {
 			}
 		}
 	}
-	// fmt.Printf("Length of data is %d \n", len(newData))
-	// fmt.Printf("start offset: %d, end offset: %d\n", startOffset, endOffset)
-	// fmt.Printf("Write data: %v\n", data)
 	if len(newData) >= 4*1024 {
 		svr.wg2.Wait()
 		svr.wg2.Add(1)
 		svr.flushToNfs(startOffset, newData)
-		fmt.Fprintf(svr.debugStream, "NFS,write:%v\n", time.Since(start).Nanoseconds())
 	} else {
-		// fmt.Println("Inserting")
-
-		// fmt.Printf("cache size: %v\n", svr.cache.Size())
 		if svr.cache.Size() == 128 {
 			_ = svr.evictMinEntry()
 		}
@@ -661,16 +515,12 @@ func (svr *Server) writeToCache(startOffset int64, data []byte) {
 		t.endOffset = endOffset
 		t.data = make([]byte, len(newData))
 		copy(t.data, newData)
-		// fmt.Printf("data: %v\n", t.data)
 		svr.cache.Insert(startOffset, endOffset, *t)
-		fmt.Fprintf(svr.debugStream, "Cache,write:%v\n", time.Since(start).Nanoseconds())
 	}
 }
 
 func (svr *Server) flushToNfs(writeOffset int64, data []byte) {
 	defer svr.wg2.Done()
-	// fmt.Printf("Flushing offset: %d , data length: %d\n", writeOffset, len(data))
-	// fmt.Printf("data: %v\n", data)
 	svr.nfsFile.Seek(writeOffset, io.SeekStart)
 	svr.nfsFile.Write(data)
 }
@@ -798,57 +648,17 @@ func (p *sshFxpOpenPacket) hasPflags(flags ...uint32) bool {
 	return true
 }
 func (p *sshFxpOpenPacket) respond(svr *Server) responsePacket {
-	// var osFlags int
-	// if p.hasPflags(sshFxfRead, sshFxfWrite) {
-	// 	osFlags |= os.O_RDWR
-	// } else if p.hasPflags(sshFxfWrite) {
-	// 	osFlags |= os.O_WRONLY
-	// } else if p.hasPflags(sshFxfRead) {
-	// 	osFlags |= os.O_RDONLY
-	// } else {
-	// 	// how are they opening?
-	// 	return statusFromError(p.ID, syscall.EINVAL)
-	// }
+	// fmt.Fprintf(svr.debugStream, "Path in packet: %v\n", p.Path)
 
-	// Don't use O_APPEND flag as it conflicts with WriteAt.
-	// The sshFxfAppend flag is a no-op here as the client sends the offsets.
-
-	// if p.hasPflags(sshFxfCreat) {
-	// 	osFlags |= os.O_CREATE
-	// }
-	// if p.hasPflags(sshFxfTrunc) {
-	// 	osFlags |= os.O_TRUNC
-	// }
-	// if p.hasPflags(sshFxfExcl) {
-	// 	osFlags |= os.O_EXCL
-	// }
-
-	// mode := os.FileMode(0o644)
-	// Like OpenSSH, we only handle permissions here, and only when the file is being created.
-	// Otherwise, the permissions are ignored.
-	// if p.Flags&sshFileXferAttrPermissions != 0 {
-	// 	fs, err := p.unmarshalFileStat(p.Flags)
-	// 	if err != nil {
-	// 		return statusFromError(p.ID, err)
-	// 	}
-	// 	mode = fs.FileMode() & os.ModePerm
-	// }
-	fmt.Fprintf(svr.debugStream, "Path in packet: %v\n", p.Path)
-	path := svr.toLocalPath(p.Path)
-	fmt.Fprintln(svr.debugStream, path)
-
-	host := "10.45.129.247"
+	host := "10.45.129.247" // Make this configurable?
 	// target := "/default-container-17246812063770"
 	target := "/" + strings.Split(p.Path, "/")[1]
 	modifiedPath := strings.Split(p.Path, target)[1]
-	fmt.Println(target)
-	fmt.Println(modifiedPath)
 
 	mount, err := nfs.DialMount(host)
 	if err != nil {
 		fmt.Fprint(svr.debugStream, err.Error())
 	}
-	// defer mount.Close()
 
 	hostname, _ := os.Hostname()
 	auth := rpc.NewAuthUnix(hostname, 1000, 1000)
@@ -857,7 +667,6 @@ func (p *sshFxpOpenPacket) respond(svr *Server) responsePacket {
 	if err != nil {
 		fmt.Fprint(svr.debugStream, err.Error())
 	}
-	// defer v.Close()
 
 	svr.nfsTarget = v
 
@@ -868,7 +677,7 @@ func (p *sshFxpOpenPacket) respond(svr *Server) responsePacket {
 		return statusFromError(p.ID, err)
 	}
 
-	fmt.Fprintf(svr.debugStream, "Determined file size is: %v\n", fileSize)
+	// fmt.Fprintf(svr.debugStream, "Determined file size is: %v\n", fileSize)
 
 	svr.nfsFileSize = fileSize
 
@@ -879,16 +688,10 @@ func (p *sshFxpOpenPacket) respond(svr *Server) responsePacket {
 		fmt.Fprintln(svr.debugStream, err.Error())
 	}
 	svr.nfsFile = f
-	// wg.Add(1)
-	// go nfsManager(svr.nfsFile)
-	// f, err := os.OpenFile(svr.toLocalPath(p.Path), osFlags, mode)
-	// if err != nil {
-	// 	return statusFromError(p.ID, err)
-	// }
 
 	var dummyFile *os.File = nil
 	handle := svr.nextHandle(dummyFile)
-	fmt.Fprintf(svr.debugStream, "handle: %v\n", handle)
+	// fmt.Fprintf(svr.debugStream, "handle: %v\n", handle)
 	return &sshFxpHandlePacket{ID: p.ID, Handle: handle}
 }
 
@@ -920,53 +723,8 @@ func determineFileSize(svr *Server, path string) (int64, error) {
 }
 
 func (p *sshFxpOpenPacket) respondOld(svr *Server) string {
-	// var osFlags int
-	// if p.hasPflags(sshFxfRead, sshFxfWrite) {
-	// 	osFlags |= os.O_RDWR
-	// } else if p.hasPflags(sshFxfWrite) {
-	// 	osFlags |= os.O_WRONLY
-	// } else if p.hasPflags(sshFxfRead) {
-	// 	osFlags |= os.O_RDONLY
-	// }
-	// } else {
-	// 	// how are they opening?
-	// 	return statusFromError(p.ID, syscall.EINVAL)
-	// }
-
-	// Don't use O_APPEND flag as it conflicts with WriteAt.
-	// The sshFxfAppend flag is a no-op here as the client sends the offsets.
-
-	// if p.hasPflags(sshFxfCreat) {
-	// 	osFlags |= os.O_CREATE
-	// }
-	// if p.hasPflags(sshFxfTrunc) {
-	// 	osFlags |= os.O_TRUNC
-	// }
-	// if p.hasPflags(sshFxfExcl) {
-	// 	osFlags |= os.O_EXCL
-	// }
-
-	// mode := os.FileMode(0o644)
-	// Like OpenSSH, we only handle permissions here, and only when the file is being created.
-	// Otherwise, the permissions are ignored.
-	// if p.Flags&sshFileXferAttrPermissions != 0 {
-	// 	fs, err := p.unmarshalFileStat(p.Flags)
-	// 	if err != nil {
-	// 		return ""
-	// 		// return statusFromError(p.ID, err)
-	// 	}
-	// 	mode = fs.FileMode() & os.ModePerm
-	// }
-	// fmt.Fprintf(svr.debugStream, "local path file: %v\n", svr.toLocalPath(p.Path))
-	// f, err := os.OpenFile("/home/nutanix/sahil2"+svr.toLocalPath(p.Path), osFlags, mode)
-	// if err != nil {
-	// 	return "this is the issue\n"
-	// 	// return statusFromError(p.ID, err)
-	// }
 	var f *os.File = nil
-	// TODO: This needs to be removed and no local file should be created
 	return svr.nextHandle(f)
-	// return &sshFxpHandlePacket{ID: p.ID, Handle: handle}
 }
 
 func (p *sshFxpReaddirPacket) respond(svr *Server) responsePacket {
